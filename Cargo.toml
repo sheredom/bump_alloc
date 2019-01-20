@@ -1,0 +1,18 @@
+[package]
+license = "CC0-1.0"
+name = "bump_alloc"
+version = "0.1.0"
+authors = ["Neil Henning <sheredom@gmail.com>"]
+edition = "2018"
+description = "global_allocator implementation of a bump allocator"
+repository = "https://github.com/sheredom/bump_alloc"
+readme = "README.md"
+keywords = ["bump", "allocator", "GlobalAlloc", "global_allocator"]
+
+[dependencies]
+kernel32-sys = "0.2.1"
+libc = "0.2.46"
+winapi = { version = "0.3.6", features = ["minwindef", "winnt"] }
+
+[badges]
+travis-ci = { repository = "sheredom/bump_alloc" }
