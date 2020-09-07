@@ -1,33 +1,26 @@
-#[cfg(windows)]
-extern crate kernel32;
-
-#[cfg(windows)]
-extern crate winapi;
-
 #[cfg(target_os = "linux")]
 extern crate libc;
 
-use std::alloc::{handle_alloc_error, GlobalAlloc, Layout};
-use std::cell::UnsafeCell;
-use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use ::once_cell::sync::OnceCell;
 
-fn align_to(size: usize, align: usize) -> usize {
-    (size + align - 1) & !(align - 1)
-}
-
-struct Inner {
-    offset: AtomicUsize,
-    mmap: *mut u8,
-    initializing: AtomicBool,
-}
+use ::std::{
+    alloc::{GlobalAlloc, Layout},
+    ptr,
+    sync::atomic::{self, AtomicUsize},
+};
 
 pub struct BumpAlloc {
-    inner: UnsafeCell<Inner>,
+    mmap: OnceCell<*mut u8>,
+    offset: AtomicUsize,
     size: usize,
 }
 
+// Safety: The `&Self` methods(s) are thread-safe
 unsafe impl Sync for BumpAlloc {}
+
+// Safety: No thread-local storage, no `&mut`-based API that we should be
+// careful with (For instance, no `Drop`!)
+unsafe impl Send for BumpAlloc {}
 
 impl BumpAlloc {
     pub const fn new() -> BumpAlloc {
@@ -36,71 +29,98 @@ impl BumpAlloc {
 
     pub const fn with_size(size: usize) -> BumpAlloc {
         BumpAlloc {
-            inner: UnsafeCell::new(Inner {
-                initializing: AtomicBool::new(true),
-                mmap: null_mut(),
-                offset: AtomicUsize::new(0),
-            }),
+            mmap: OnceCell::new(),
+            offset: AtomicUsize::new(0),
             size,
+        }
+    }
+
+    /// We don't need to be `unsafe` since we do handle zero-sized allocations.
+    fn alloc(self: &Self, layout: Layout) -> Option<ptr::NonNull<u8>> {
+        #[cfg(windows)]
+        fn mmap_wrapper(size: usize) -> *mut u8 {
+            // type of the size parameter to VirtualAlloc
+            #[cfg(target_pointer_width = "32")]
+            type WindowsSize = u32;
+            #[cfg(target_pointer_width = "64")]
+            type WindowsSize = u64;
+
+            unsafe {
+                use ::winapi::um::winnt;
+                ::kernel32::VirtualAlloc(
+                    null_mut(),
+                    size as WindowsSize,
+                    winnt::MEM_COMMIT | winnt::MEM_RESERVE,
+                    winnt::PAGE_READWRITE,
+                ) as *mut u8
+            }
+        }
+
+        #[cfg(all(unix, not(target_os = "android")))]
+        fn mmap_wrapper(size: usize) -> *mut u8 {
+            // Since `mmap` could return `NULL`, which isn't a valid address in
+            // Rust, we request one more byte and offset the result by one
+            let size = size.checked_add(1).expect("Overflow");
+            let ptr = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                // `mmap()` failed.
+                ptr::null_mut()
+            } else {
+                unsafe {
+                    // Safety: from having allocated `size + 1` bytes.
+                    (ptr as *mut u8).add(1)
+                }
+            }
+        }
+
+        fn align_to(size: usize, align: usize) -> Option<usize> {
+            Some(size.checked_add(align - 1)? & !(align - 1))
+        }
+
+        let &mmap_start = self.mmap.get_or_init(|| mmap_wrapper(self.size));
+        if mmap_start.is_null() {
+            return None;
+        }
+        loop {
+            // speculative read
+            let offset = self.offset.load(atomic::Ordering::Relaxed);
+            let unaligned_start = unsafe { mmap_start.add(offset) } as usize;
+            let aligned_start = align_to(unaligned_start, layout.align())?;
+            let end = aligned_start.checked_add(layout.size())?;
+            let new_offset = (end as usize) - (mmap_start as usize);
+            if new_offset > self.size {
+                return None;
+            }
+            // offsets increase, so no ABA.
+            if self.offset.compare_and_swap(
+                offset,
+                new_offset,
+                // Safety: no (other) shared data to sync with / protect
+                atomic::Ordering::Relaxed,
+            ) == offset
+            {
+                return ptr::NonNull::new(aligned_start as _);
+            }
+            // speculative read failed, try again
         }
     }
 }
 
-// type of the size parameter to VirtualAlloc
-#[cfg(all(windows, target_pointer_width = "32"))]
-type WindowsSize = u32;
-#[cfg(all(windows, target_pointer_width = "64"))]
-type WindowsSize = u64;
-
-#[cfg(windows)]
-unsafe fn mmap_wrapper(size: usize) -> *mut u8 {
-    kernel32::VirtualAlloc(
-        null_mut(),
-        size as WindowsSize,
-        winapi::um::winnt::MEM_COMMIT | winapi::um::winnt::MEM_RESERVE,
-        winapi::um::winnt::PAGE_READWRITE,
-    ) as *mut u8
-}
-
-#[cfg(all(unix, not(target_os = "android")))]
-unsafe fn mmap_wrapper(size: usize) -> *mut u8 {
-    libc::mmap(
-        null_mut(),
-        size,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-        -1,
-        0,
-    ) as *mut u8
-}
-
 unsafe impl GlobalAlloc for BumpAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let inner = &mut *self.inner.get();
-
-        // If initializing is true it means we need to do the original mmap.
-        if inner.initializing.swap(false, Ordering::Relaxed) {
-            inner.mmap = mmap_wrapper(self.size);
-
-            if (*inner.mmap as isize) == -1isize {
-                handle_alloc_error(layout);
-            }
-        } else {
-            // Spin loop waiting on the mmap to be ready.
-            while 0 == inner.offset.load(Ordering::Relaxed) {}
-        }
-
-        let bytes_required = align_to(layout.size() + layout.align(), layout.align());
-
-        let my_offset = inner.offset.fetch_add(bytes_required, Ordering::Relaxed);
-
-        let aligned_offset = align_to(my_offset, layout.align());
-
-        if (aligned_offset + layout.size()) > self.size {
-            handle_alloc_error(layout);
-        }
-
-        inner.mmap.offset(aligned_offset as isize)
+        #![deny(unconditional_recursion)]
+        self.alloc(layout)
+            // This should optimize down to a transmute.
+            .map_or(ptr::null_mut(), ptr::NonNull::as_ptr)
     }
 
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
